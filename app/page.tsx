@@ -19,7 +19,11 @@ type QualityStatus = {
 const ANALYSIS_INTERVAL_MS = 400;
 const ANALYSIS_MAX_WIDTH = 480;
 const HISTORY_SIZE = 3;
-const OPENCV_SRC = "https://docs.opencv.org/4.10.0/opencv.js";
+const OPENCV_SOURCES = [
+  "https://docs.opencv.org/4.10.0/opencv.js",
+  "https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.12.0-release.1/dist/opencv.js",
+];
+const OPENCV_LOAD_TIMEOUT_MS = 30000;
 
 function median(values: number[]) {
   if (values.length === 0) {
@@ -30,60 +34,113 @@ function median(values: number[]) {
   return sorted[Math.floor(sorted.length / 2)];
 }
 
-function loadOpenCv(): Promise<CvModule> {
+function resolveCvRuntime(cv: CvModule): Promise<CvModule> {
+  if (cv?.Mat) {
+    return Promise.resolve(cv);
+  }
+
+  if (typeof cv?.then === "function") {
+    return cv.then((resolvedCv: CvModule) => resolveCvRuntime(resolvedCv));
+  }
+
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      reject(new Error("OpenCV.js の初期化がタイムアウトしました。"));
+    }, OPENCV_LOAD_TIMEOUT_MS);
+
+    const previousInitializer = cv?.onRuntimeInitialized;
+    if (cv) {
+      cv.onRuntimeInitialized = () => {
+        if (typeof previousInitializer === "function") {
+          previousInitializer();
+        }
+        window.clearTimeout(timeout);
+        resolve(cv);
+      };
+    } else {
+      reject(new Error("OpenCV.js did not expose window.cv."));
+    }
+  });
+}
+
+function waitForOpenCvGlobal(): Promise<CvModule> {
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      const cv = (window as Window & { cv?: CvModule }).cv;
+      if (cv) {
+        window.clearInterval(timer);
+        resolveCvRuntime(cv).then(resolve).catch(reject);
+        return;
+      }
+
+      if (Date.now() - startedAt > OPENCV_LOAD_TIMEOUT_MS) {
+        window.clearInterval(timer);
+        reject(new Error("OpenCV.js did not expose window.cv."));
+      }
+    }, 100);
+  });
+}
+
+async function loadOpenCv(): Promise<CvModule> {
   if (typeof window === "undefined") {
     return Promise.reject(new Error("OpenCV.js can only be loaded in a browser."));
   }
 
   const existingCv = (window as Window & { cv?: CvModule }).cv;
-  if (existingCv?.Mat) {
-    return Promise.resolve(existingCv);
+  if (existingCv) {
+    return resolveCvRuntime(existingCv);
   }
 
-  const existingScript = document.querySelector<HTMLScriptElement>(
-    `script[src="${OPENCV_SRC}"]`,
-  );
+  let lastError: Error | null = null;
 
-  return new Promise((resolve, reject) => {
-    const finishWhenReady = () => {
-      const cv = (window as Window & { cv?: CvModule }).cv;
-      if (!cv) {
-        reject(new Error("OpenCV.js did not expose window.cv."));
-        return;
-      }
+  for (const source of OPENCV_SOURCES) {
+    try {
+      const existingScript = document.querySelector<HTMLScriptElement>(`script[src="${source}"]`);
 
-      if (cv.Mat) {
-        resolve(cv);
-        return;
-      }
+      await new Promise<void>((resolve, reject) => {
+        if (existingScript?.dataset.loaded === "true") {
+          resolve();
+          return;
+        }
 
-      cv.onRuntimeInitialized = () => resolve(cv);
-    };
+        const script = existingScript ?? document.createElement("script");
+        const timeout = window.setTimeout(() => {
+          reject(new Error(`OpenCV.js load timed out: ${source}`));
+        }, OPENCV_LOAD_TIMEOUT_MS);
 
-    if (existingScript) {
-      if (existingScript.dataset.loaded === "true") {
-        finishWhenReady();
-      } else {
-        existingScript.addEventListener("load", finishWhenReady, { once: true });
-        existingScript.addEventListener(
-          "error",
-          () => reject(new Error("OpenCV.js failed to load.")),
+        script.addEventListener(
+          "load",
+          () => {
+            window.clearTimeout(timeout);
+            script.dataset.loaded = "true";
+            resolve();
+          },
           { once: true },
         );
-      }
-      return;
-    }
+        script.addEventListener(
+          "error",
+          () => {
+            window.clearTimeout(timeout);
+            reject(new Error(`OpenCV.js failed to load: ${source}`));
+          },
+          { once: true },
+        );
 
-    const script = document.createElement("script");
-    script.src = OPENCV_SRC;
-    script.async = true;
-    script.onload = () => {
-      script.dataset.loaded = "true";
-      finishWhenReady();
-    };
-    script.onerror = () => reject(new Error("OpenCV.js failed to load."));
-    document.body.appendChild(script);
-  });
+        if (!existingScript) {
+          script.src = source;
+          script.async = true;
+          document.body.appendChild(script);
+        }
+      });
+
+      return await waitForOpenCvGlobal();
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error("OpenCV.js failed to load.");
+    }
+  }
+
+  throw lastError ?? new Error("OpenCV.js failed to load.");
 }
 
 function getWarnings(quality: QualityStatus, countHistory: number[]) {
@@ -156,7 +213,7 @@ export default function Home() {
           return;
         }
         setCvStatus("error");
-        setErrorMessage(error.message);
+        setErrorMessage(`${error.message} カメラ起動は可能ですが、解析は実行できません。`);
       });
 
     return () => {
@@ -360,8 +417,9 @@ export default function Home() {
   }, [drawOverlay]);
 
   const startCamera = useCallback(async () => {
-    if (cvStatus !== "ready") {
-      setErrorMessage("OpenCV.js の読み込み完了後にカメラを起動してください。");
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setCameraStatus("error");
+      setErrorMessage("このブラウザはカメラ取得に対応していません。");
       return;
     }
 
@@ -410,7 +468,7 @@ export default function Home() {
           : "カメラを起動できませんでした。ブラウザの権限を確認してください。",
       );
     }
-  }, [analyzeFrame, cvStatus, stopCamera]);
+  }, [analyzeFrame, stopCamera]);
 
   const resetMeasurement = useCallback(() => {
     historyRef.current = [];
@@ -438,8 +496,8 @@ export default function Home() {
     setConfirmedCount(stableCount);
   }, [stableCount]);
 
-  const statusLabel = cvStatus === "ready" ? "解析準備完了" : cvStatus === "error" ? "OpenCV読込エラー" : "OpenCV読込中";
-  const canStartCamera = cvStatus === "ready" && cameraStatus !== "starting";
+  const statusLabel = cvStatus === "ready" ? "解析準備完了" : cvStatus === "error" ? "カメラのみ利用可" : "解析読込中";
+  const canStartCamera = cameraStatus !== "starting";
   const canUseMeasurement = cameraStatus === "ready";
 
   return (
